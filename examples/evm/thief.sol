@@ -1,7 +1,4 @@
-//SPDX-License-Identifier; Unlicensed
-//pragma solidity ^0.8.17:
 import "bank.sol"
-
 contract Attack {
   Bank public bank;
   
