@@ -1,11 +1,10 @@
-pragma solidity 0.7.0;
+contract Underflow {
+    uint private Balance;
+    
+    function sub(uint val) returns (bool, uint){
+        Balance -= val; // complicated math with possible underflow
 
-contract C {
-    function() {
-        if (msg.data[0] == 1) {
-            return;
-        }else{
-            return;
-        }
+        // possible auditor assert
+        assert(Balance =< val); 
     }
 }
