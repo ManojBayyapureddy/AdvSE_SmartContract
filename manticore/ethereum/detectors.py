@@ -236,10 +236,10 @@ class DetectInvalid(Detector):
 class DetectReentrancySimple(Detector):
     """
     Simple detector for reentrancy bugs.
-    Alert if contract changes the state of storage (does a write) after a 
-    call with >2300 gas to a user controlled/symbolic
+    Alert if contract changes the state of storage (does a write) after a call with >2300 gas to a user controlled/symbolic
     external address or the msg.sender address.
     """
+
     ARGUMENT = "reentrancy"
     HELP = "Reentrancy bug"
     IMPACT = DetectorClassification.HIGH
@@ -455,7 +455,7 @@ class DetectIntegerOverflow(Detector):
         add = Operators.ZEXTEND(a, 512) + Operators.ZEXTEND(b, 512)
         cond = Operators.UGE(add, 1 << 256)
         return cond
-
+ 
     @staticmethod
     def _signed_mul_overflow(state, a, b):
         """
@@ -508,7 +508,7 @@ class DetectIntegerOverflow(Detector):
                 if state.can_be_true(condition):
                     self.add_finding(state, address, pc, finding, at_init, condition)
 
-    def did_evm_execute_instruction_callback(self, state, instruction, arguments, result):
+    def did_evm_execute_instruction_callback(self, state, instruction, arguments,result):
         vm = state.platform.current_vm
         mnemonic = instruction.semantics
         ios = False
@@ -517,28 +517,12 @@ class DetectIntegerOverflow(Detector):
         if mnemonic == "ADD":
             ios = self._signed_add_overflow(state, *arguments)
             iou = self._unsigned_add_overflow(state, *arguments)
-        elif mnemonic == "MUL":
-            ios = self._signed_mul_overflow(state, *arguments)
-            iou = self._unsigned_mul_overflow(state, *arguments)
-        elif mnemonic == "SUB":
-            ios = self._signed_sub_overflow(state, *arguments)
-            iou = self._unsigned_sub_overflow(state, *arguments)
         elif mnemonic == "SSTORE":
             # If an overflowded value is stored in the storage then it is a finding
             # Todo: save this in a stack and only do the check if this does not
             #  revert/rollback
             where, what = arguments
             self._check_finding(state, what)
-        elif mnemonic == "RETURN":
-            world = state.platform
-            if world.current_transaction.is_human:
-                # If an overflowded value is returned to a human
-                offset, size = arguments
-                data = world.current_vm.read_buffer(offset, size)
-                self._check_finding(state, data)
-
-        if mnemonic in ("SLT", "SGT", "SDIV", "SMOD"):
-            result = taint_with(result, "SIGNED")
         if mnemonic in ("ADD", "SUB", "MUL"):
             id_val = self._save_current_location(
                 state, "Signed integer overflow at %s instruction" % mnemonic, ios
@@ -554,7 +538,178 @@ class DetectIntegerOverflow(Detector):
             vm.change_last_result(result)
 
 
+class DetectUnusedRetVal(Detector):
+    """Detects unused return value from internal transactions"""
 
+    ARGUMENT = "unused-return"
+    HELP = "Unused internal transaction return values"
+    IMPACT = DetectorClassification.LOW
+    CONFIDENCE = DetectorClassification.HIGH
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._stack_name = "{:s}.stack".format(self.name)
+
+    def _add_retval_taint(self, state, taint):
+        taints = state.context[self._stack_name][-1]
+        taints.add(taint)
+        state.context[self._stack_name][-1] = taints
+
+    def _remove_retval_taint(self, state, taint):
+        taints = state.context[self._stack_name][-1]
+        if taint in taints:
+            taints.remove(taint)
+            state.context[self._stack_name][-1] = taints
+
+    def _get_retval_taints(self, state):
+        return state.context[self._stack_name][-1]
+
+    def will_open_transaction_callback(self, state, tx):
+        # Reset reading log on new human transactions
+        if tx.is_human:
+            state.context[self._stack_name] = []
+        state.context[self._stack_name].append(set())
+
+    def did_close_transaction_callback(self, state, tx):
+        world = state.platform
+        # Check that all retvals were used in control flow
+        for taint in self._get_retval_taints(state):
+            id_val = taint[7:]
+            address, pc, finding, at_init, condition = self._get_location(state, id_val)
+            if state.can_be_true(condition):
+                self.add_finding(state, address, pc, finding, at_init)
+
+        state.context[self._stack_name].pop()
+
+    def did_evm_execute_instruction_callback(self, state, instruction, arguments, result):
+        world = state.platform
+        mnemonic = instruction.semantics
+        current_vm = world.current_vm
+        if instruction.is_starttx:
+            # A transactional instruction just returned so we add a taint to result
+            # and add that taint to the set
+            id_val = self._save_current_location(
+                state, "Returned value at {:s} instruction is not used".format(mnemonic)
+            )
+            taint = "RETVAL_{:s}".format(id_val)
+            current_vm.change_last_result(taint_with(result, taint))
+            self._add_retval_taint(state, taint)
+        elif mnemonic == "JUMPI":
+            dest, cond = arguments
+            for used_taint in get_taints(cond, "RETVAL_.*"):
+                self._remove_retval_taint(state, used_taint)
+
+
+class DetectDelegatecall(Detector):
+    """
+    Detects DELEGATECALLs to controlled addresses and or with controlled function id.
+    This detector finds and reports on any delegatecall instruction any the following propositions are hold:
+        * the destination address can be controlled by the caller
+        * the first 4 bytes of the calldata are controlled by the caller
+    """
+
+    ARGUMENT = "delegatecall"
+    HELP = "Problematic uses of DELEGATECALL instruction"
+    IMPACT = DetectorClassification.HIGH
+    CONFIDENCE = DetectorClassification.HIGH
+
+    def _to_constant(self, expression):
+        if isinstance(expression, Constant):
+            return expression.value
+        return expression
+
+    def will_evm_execute_instruction_callback(self, state, instruction, arguments):
+        world = state.platform
+        mnemonic = instruction.semantics
+
+        # If it executed a DELEGATECALL
+        # TODO: Check the transaction was success
+        # if blockchain.last_transaction.return_value:
+        # TODO: check if any of the potential target addresses has code
+        # if not any( world.get_code, possible_addresses):
+        if mnemonic == "DELEGATECALL":
+            gas, address, in_offset, in_size, out_offset, out_size = arguments
+            if issymbolic(address):
+                possible_addresses = state.solve_n(address, 2)
+                if len(possible_addresses) > 1:
+                    self.add_finding_here(state, "Delegatecall to user controlled address")
+
+            in_offset = self._to_constant(in_offset)
+            in_size = self._to_constant(in_size)
+            calldata = world.current_vm.read_buffer(in_offset, in_size)
+            func_id = calldata[:4]
+            if issymbolic(func_id):
+                possible_func_ids = state.solve_n(func_id, 2)
+                if len(possible_func_ids) > 1:
+                    self.add_finding_here(state, "Delegatecall to user controlled function")
+
+
+class DetectUninitializedMemory(Detector):
+    """
+    Detects uses of uninitialized memory
+    """
+
+    ARGUMENT = "uninitialized-memory"
+    HELP = "Uninitialized memory usage"
+    IMPACT = DetectorClassification.MEDIUM
+    CONFIDENCE = DetectorClassification.HIGH
+
+    def did_evm_read_memory_callback(self, state, offset, value, size):
+        initialized_memory = state.context.get("{:s}.initialized_memory".format(self.name), set())
+        cbu = True  # Can be unknown
+        current_contract = state.platform.current_vm.address
+        for known_contract, known_offset in initialized_memory:
+            if current_contract == known_contract:
+                for offset_i in range(size):
+                    cbu = Operators.AND(cbu, (offset + offset_i) != known_offset)
+        if state.can_be_true(cbu):
+            self.add_finding_here(
+                state,
+                "Potentially reading uninitialized memory at instruction (address: %r, offset %r)"
+                % (current_contract, offset),
+            )
+
+    def did_evm_write_memory_callback(self, state, offset, value, size):
+        current_contract = state.platform.current_vm.address
+
+        # concrete or symbolic write
+        for offset_i in range(size):
+            state.context.setdefault("{:s}.initialized_memory".format(self.name), set()).add(
+                (current_contract, offset + offset_i)
+            )
+
+
+class DetectUninitializedStorage(Detector):
+    """
+    Detects uses of uninitialized storage
+    """
+
+    ARGUMENT = "uninitialized-storage"
+    HELP = "Uninitialized storage usage"
+    IMPACT = DetectorClassification.MEDIUM
+    CONFIDENCE = DetectorClassification.HIGH
+
+    def did_evm_read_storage_callback(self, state, address, offset, value):
+        if not state.can_be_true(value != 0):
+            # Not initialized memory should be zero
+            return
+        # check if offset is known
+        cbu = True  # Can be unknown
+        context_name = "{:s}.initialized_storage".format(self.name)
+        for known_address, known_offset in state.context.get(context_name, ()):
+            cbu = Operators.AND(cbu, Operators.OR(address != known_address, offset != known_offset))
+
+        if state.can_be_true(cbu):
+            self.add_finding_here(state, "Potentially reading uninitialized storage", cbu)
+
+    def did_evm_write_storage_callback(self, state, address, offset, value):
+        # concrete or symbolic write
+        state.context.setdefault("{:s}.initialized_storage".format(self.name), set()).add(
+            (address, offset)
+        )
+
+
+class DetectRaceCondition(Detector):
     """
     Detects possible transaction race conditions (transaction order dependencies)
 
