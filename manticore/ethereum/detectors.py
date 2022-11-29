@@ -382,58 +382,20 @@ class DetectIntegerOverflow(Detector):
     IMPACT = DetectorClassification.HIGH
     CONFIDENCE = DetectorClassification.HIGH
 
-    @staticmethod
-    def _signed_sub_overflow(state, a, b):
-        """
-        Sign extend the value to 512 bits and check the result can be represented
-         in 256. Following there is a 32 bit excerpt of this condition:
-        a  -  b   -80000000 -3fffffff -00000001 +00000000 +00000001 +3fffffff +7fffffff
-        +80000000    False    False    False    False     True     True     True
-        +c0000001    False    False    False    False    False    False     True
-        +ffffffff    False    False    False    False    False    False    False
-        +00000000     True    False    False    False    False    False    False
-        +00000001     True    False    False    False    False    False    False
-        +3fffffff     True    False    False    False    False    False    False
-        +7fffffff     True     True     True    False    False    False    False
-        """
-        sub = Operators.SEXTEND(a, 256, 512) - Operators.SEXTEND(b, 256, 512)
-        cond = Operators.OR(sub < -(1 << 255), sub >= (1 << 255))
-        return cond
+   
+  @staticmethod
+    def _check_signed_add_overflow(state, a, b):
+        add = Operators.SEXTEND(a, 256, 512) + Operators.SEXTEND(b, 256, 512)
+        return add >= b
 
     @staticmethod
     def _signed_add_overflow(state, a, b):
-        """
-        Sign extend the value to 512 bits and check the result can be represented
-         in 256. Following there is a 32 bit excerpt of this condition:
-
-        a  +  b   -80000000 -3fffffff -00000001 +00000000 +00000001 +3fffffff +7fffffff
-        +80000000     True     True     True    False    False    False    False
-        +c0000001     True    False    False    False    False    False    False
-        +ffffffff     True    False    False    False    False    False    False
-        +00000000    False    False    False    False    False    False    False
-        +00000001    False    False    False    False    False    False     True
-        +3fffffff    False    False    False    False    False    False     True
-        +7fffffff    False    False    False    False     True     True     True
-        """
         add = Operators.SEXTEND(a, 256, 512) + Operators.SEXTEND(b, 256, 512)
         cond = Operators.OR(add < -(1 << 255), add >= (1 << 255))
         return cond
 
     @staticmethod
     def _unsigned_sub_overflow(state, a, b):
-        """
-        Sign extend the value to 512 bits and check the result can be represented
-         in 256. Following there is a 32 bit excerpt of this condition:
-
-        a  -  b   ffffffff bfffffff 80000001 00000000 00000001 3ffffffff 7fffffff
-        ffffffff     True     True     True    False     True     True     True
-        bfffffff     True     True     True    False    False     True     True
-        80000001     True     True     True    False    False     True     True
-        00000000    False    False    False    False    False     True    False
-        00000001     True    False    False    False    False     True    False
-        ffffffff     True     True     True     True     True     True     True
-        7fffffff     True     True     True    False    False     True    False
-        """
         cond = Operators.UGT(b, a)
         return cond
 
@@ -455,7 +417,7 @@ class DetectIntegerOverflow(Detector):
         add = Operators.ZEXTEND(a, 512) + Operators.ZEXTEND(b, 512)
         cond = Operators.UGE(add, 1 << 256)
         return cond
- 
+
     @staticmethod
     def _signed_mul_overflow(state, a, b):
         """
@@ -508,21 +470,29 @@ class DetectIntegerOverflow(Detector):
                 if state.can_be_true(condition):
                     self.add_finding(state, address, pc, finding, at_init, condition)
 
-    def did_evm_execute_instruction_callback(self, state, instruction, arguments,result):
+    def did_evm_execute_instruction_callback(self, state, instruction, arguments, result):
         vm = state.platform.current_vm
         mnemonic = instruction.semantics
         ios = False
         iou = False
-
+        cios = False
+        #check first if the resultant value is not negative then only add the value
         if mnemonic == "ADD":
-            ios = self._signed_add_overflow(state, *arguments)
+            cios = self._check_signed_add_overflow(state, *arguments)
+
             iou = self._unsigned_add_overflow(state, *arguments)
-        elif mnemonic == "SSTORE":
-            # If an overflowded value is stored in the storage then it is a finding
-            # Todo: save this in a stack and only do the check if this does not
-            #  revert/rollback
-            where, what = arguments
-            self._check_finding(state, what)
+            if cios!=True:
+            ios = self._signed_add_overflow(state, *arguments)
+            else :
+                ios=cios
+        elif mnemonic == "RETURN":
+            world = state.platform
+            if world.current_transaction.is_human:
+                # If an overflowded value is returned to a human
+                offset, size = arguments
+                data = world.current_vm.read_buffer(offset, size)
+                self._check_finding(state, data)
+
         if mnemonic in ("ADD", "SUB", "MUL"):
             id_val = self._save_current_location(
                 state, "Signed integer overflow at %s instruction" % mnemonic, ios
@@ -533,9 +503,6 @@ class DetectIntegerOverflow(Detector):
                 state, "Unsigned integer overflow at %s instruction" % mnemonic, iou
             )
             result = taint_with(result, "IOU_{:s}".format(id_val))
-
-        if mnemonic in ("SLT", "SGT", "SDIV", "SMOD", "ADD", "SUB", "MUL"):
-            vm.change_last_result(result)
 
 
 class DetectUnusedRetVal(Detector):
